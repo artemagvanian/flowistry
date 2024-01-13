@@ -153,6 +153,14 @@ impl CallString {
   pub fn iter_from_root(&self) -> impl DoubleEndedIterator<Item = GlobalLocation> + '_ {
     self.0.iter().copied()
   }
+
+  pub fn len(self) -> usize {
+    self.0.len()
+  }
+
+  pub fn is_empty(self) -> bool {
+    self.0.is_empty()
+  }
 }
 
 impl fmt::Display for CallString {

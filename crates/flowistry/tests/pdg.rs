@@ -1,18 +1,34 @@
 #![feature(rustc_private)]
 
 extern crate either;
+extern crate rustc_hir;
 extern crate rustc_middle;
 
 use std::collections::HashSet;
 
 use either::Either;
-use flowistry::pdg::graph::{DepEdge, DepGraph};
+use flowistry::pdg::{
+  graph::{DepEdge, DepGraph},
+  PdgParams,
+};
 use itertools::Itertools;
+use rustc_hir::def_id::LocalDefId;
 use rustc_middle::{
   mir::{Terminator, TerminatorKind},
   ty::TyCtxt,
 };
 use rustc_utils::{mir::borrowck_facts, source_map::find_bodies::find_bodies};
+
+fn get_main(tcx: TyCtxt<'_>) -> LocalDefId {
+  find_bodies(tcx)
+    .into_iter()
+    .map(|(_, body_id)| tcx.hir().body_owner_def_id(body_id))
+    .find(|def_id| match tcx.opt_item_name(def_id.to_def_id()) {
+      Some(name) => name.as_str() == "main",
+      None => false,
+    })
+    .expect("Missing main")
+}
 
 fn pdg(
   input: impl Into<String>,
@@ -20,16 +36,9 @@ fn pdg(
 ) {
   let _ = env_logger::try_init();
   flowistry::test_utils::compile(input, move |tcx| {
-    let def_id = find_bodies(tcx)
-      .into_iter()
-      .map(|(_, body_id)| tcx.hir().body_owner_def_id(body_id))
-      .find(|def_id| match tcx.opt_item_name(def_id.to_def_id()) {
-        Some(name) => name.as_str() == "main",
-        None => false,
-      })
-      .expect("Missing main");
-
-    let pdg = flowistry::pdg::compute_pdg(tcx, def_id);
+    let def_id = get_main(tcx);
+    let params = PdgParams::new(tcx, def_id);
+    let pdg = flowistry::pdg::compute_pdg(params);
     f(tcx, pdg)
   })
 }
@@ -460,4 +469,74 @@ pdg_test! {
     }
   },
   (x -> y)
+}
+
+#[test]
+fn call_filter() {
+  let input = r#"
+fn no_inline(a: &mut i32, b: i32) {}
+
+fn nested_layer_one(c: &mut i32, d: i32) {
+  nested_layer_two(c, d);
+}
+
+fn nested_layer_two(e: &mut i32, f: i32) {}
+
+fn main() {
+  let mut x = 0;
+  let y = 1;
+  no_inline(&mut x, y);
+
+  let mut w = 0;
+  let z = 1;
+  nested_layer_one(&mut w, z);
+}  
+"#;
+  let _ = env_logger::try_init();
+  flowistry::test_utils::compile(input, move |tcx| {
+    let def_id = get_main(tcx);
+    let params = PdgParams::new(tcx, def_id).with_call_filter(move |f, cs| {
+      let name = tcx.opt_item_name(f.def_id());
+      !matches!(name.as_ref().map(|sym| sym.as_str()), Some("no_inline")) && cs.len() < 2
+    });
+    let pdg = flowistry::pdg::compute_pdg(params);
+    assert!(connects(tcx, &pdg, "y", "x", None));
+    assert!(connects(tcx, &pdg, "z", "w", None));
+  })
+}
+
+#[test]
+fn false_call_edges() {
+  let input = r#"
+fn does_not_mutate(x: &mut i32) {}
+
+fn main() {
+  let mut x = 0;
+  does_not_mutate(&mut x);
+  let y = x;
+}  
+"#;
+  let _ = env_logger::try_init();
+  flowistry::test_utils::compile(input, move |tcx| {
+    let def_id = get_main(tcx);
+    let params = PdgParams::new(tcx, def_id);
+
+    let without_edges = flowistry::pdg::compute_pdg(params.clone());
+    assert!(!connects(
+      tcx,
+      &without_edges,
+      "x",
+      "y",
+      Some("does_not_mutate")
+    ));
+
+    let with_edges = flowistry::pdg::compute_pdg(params.with_false_call_edges());
+    assert!(connects(
+      tcx,
+      &with_edges,
+      "x",
+      "y",
+      Some("does_not_mutate")
+    ));
+  })
 }
