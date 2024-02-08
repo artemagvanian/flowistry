@@ -1,24 +1,22 @@
 use std::{borrow::Cow, iter, rc::Rc};
 
-use df::JoinSemiLattice;
+use df::{fmt::DebugWithContext, Analysis, JoinSemiLattice};
 use either::Either;
 use flowistry_pdg::{CallString, GlobalLocation, RichLocation};
 use itertools::Itertools;
 use log::{debug, trace};
 use petgraph::graph::DiGraph;
 use rustc_abi::FieldIdx;
-use rustc_ast::Mutability;
 use rustc_borrowck::consumers::{
   places_conflict, BodyWithBorrowckFacts, PlaceConflictBias,
 };
-use rustc_data_structures::graph::{self as rustc_graph, WithStartNode};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_index::IndexVec;
 use rustc_middle::{
   mir::{
     visit::Visitor, AggregateKind, BasicBlock, Body, Location, Operand, Place, PlaceElem,
-    Rvalue, Statement, StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
+    Rvalue, Statement, StatementKind, Terminator, TerminatorEdges, TerminatorKind,
+    RETURN_PLACE,
   },
   ty::{GenericArg, GenericArgsRef, List, ParamEnv, TyCtxt, TyKind},
 };
@@ -30,20 +28,93 @@ use rustc_utils::{
 
 use super::graph::{DepEdge, DepGraph, DepNode};
 use crate::{
-  infoflow::mutation::{ModularMutationVisitor, MutationStatus},
+  infoflow::mutation::{ModularMutationVisitor, Mutation, MutationStatus},
   mir::placeinfo::PlaceInfo,
   pdg::utils::{self, FnResolution},
 };
 
-type CallFilter<'tcx> = Box<dyn Fn(FnResolution<'tcx>, CallString) -> bool + 'tcx>;
+/// Whether or not to skip recursing into a function call during PDG construction.
+pub enum SkipCall {
+  /// Skip the function, and perform a modular approxmation of its effects.
+  Skip,
+
+  /// Recurse into the function as normal.
+  NoSkip,
+}
+
+/// A fake effect to insert into the PDG upon a function call.
+pub struct FakeEffect<'tcx> {
+  /// The place (in the *callee*!) subject to a fake effect.
+  pub place: Place<'tcx>,
+
+  /// The kind of fake effect to insert into the PDG.
+  pub kind: FakeEffectKind,
+}
+
+/// The kind of fake effect to insert into the PDG.
+pub enum FakeEffectKind {
+  /// A fake read to an argument of a function call.
+  ///
+  /// For example, a fake read to argument `_1` of the call `f(_5)`
+  /// would add an edge `_5@main::fcall -> _1@main->f::START`.
+  Read,
+
+  /// A fake write to an argument of a function call.
+  ///
+  /// For example, a fake write to argument `(*_1)` of the call `f(&mut _5)`
+  /// would add an edge `_5@main::<before> -> _5@main::fcall`.
+  Write,
+}
+
+/// User-provided changes to the default PDG construction behavior for function calls.
+///
+/// Construct [`CallChanges`] via [`CallChanges::default`].
+pub struct CallChanges<'tcx> {
+  skip: SkipCall,
+  fake_effects: Vec<FakeEffect<'tcx>>,
+}
+
+impl<'tcx> CallChanges<'tcx> {
+  /// Inidicate whether or not to skip recursing into the given function.
+  pub fn with_skip(self, skip: SkipCall) -> Self {
+    CallChanges { skip, ..self }
+  }
+
+  /// Provide a set of fake effect to insert into the PDG.
+  pub fn with_fake_effects(self, fake_effects: Vec<FakeEffect<'tcx>>) -> Self {
+    CallChanges {
+      fake_effects,
+      ..self
+    }
+  }
+}
+
+impl Default for CallChanges<'_> {
+  fn default() -> Self {
+    CallChanges {
+      skip: SkipCall::NoSkip,
+      fake_effects: vec![],
+    }
+  }
+}
+
+/// Information about the function being called.
+pub struct CallInfo<'tcx> {
+  /// The potentially-monomorphized resolution of the callee.
+  pub callee: FnResolution<'tcx>,
+
+  /// The call-stack up to the current call site.
+  pub call_string: CallString,
+}
+
+type CallChangeCallback<'tcx> = Box<dyn Fn(CallInfo<'tcx>) -> CallChanges<'tcx> + 'tcx>;
 
 /// Top-level parameters to PDG construction.
 #[derive(Clone)]
 pub struct PdgParams<'tcx> {
   tcx: TyCtxt<'tcx>,
   root: FnResolution<'tcx>,
-  call_filter: Option<Rc<CallFilter<'tcx>>>,
-  false_call_edges: bool,
+  call_change_callback: Option<Rc<CallChangeCallback<'tcx>>>,
 }
 
 impl<'tcx> PdgParams<'tcx> {
@@ -52,15 +123,16 @@ impl<'tcx> PdgParams<'tcx> {
     PdgParams {
       tcx,
       root: FnResolution::Partial(root.to_def_id()),
-      call_filter: None,
-      false_call_edges: false,
+      call_change_callback: None,
     }
   }
 
-  /// Provide an optional call filter.
+  /// Provide a callback for changing the behavior of how the PDG generator manages function calls.
   ///
-  /// A call filter is a user-provided callback which determines whether the PDG generator will inspect
-  /// a call site. For example, in the code:
+  /// Currently, this callback can either indicate that a function call should be skipped (i.e., not recursed into),
+  /// or indicate that a set of fake effects should occur at the function call. See [`CallChanges`] for details.
+  ///
+  /// For example, in this code:
   ///
   /// ```
   /// fn incr(x: i32) -> i32 { x + 1 }
@@ -70,72 +142,56 @@ impl<'tcx> PdgParams<'tcx> {
   /// }
   /// ```
   ///
-  /// When inspecting the call `incr(a)`, the call filter will be called with `f(incr, [main])`.
-  /// The first argument is the function being called, and the second argument is the call string.
-  ///
-  /// For example, you could apply a hard limit on call string length like this:
+  /// When inspecting the call `incr(a)`, the callback will be called with `f({callee: incr, call_string: [main]})`.
+  /// You could apply a hard limit on call string length like this:
   ///
   /// ```
   /// # #![feature(rustc_private)]
   /// # extern crate rustc_middle;
-  /// # use flowistry::pdg::PdgParams;
+  /// # use flowistry::pdg::{PdgParams, SkipCall, CallChanges};
   /// # use rustc_middle::ty::TyCtxt;
   /// # const THRESHOLD: usize = 5;
   /// # fn f<'tcx>(tcx: TyCtxt<'tcx>, params: PdgParams<'tcx>) -> PdgParams<'tcx> {
-  /// params.with_call_filter(|_, cs| cs.len() <= THRESHOLD)
-  /// # }
-  /// ```
-  ///
-  /// Or you could prevent inspection of specific functions based on their [`DefId`]:
-  ///
-  /// ```
-  /// # #![feature(rustc_private)]
-  /// # extern crate rustc_middle;
-  /// # use flowistry::pdg::PdgParams;
-  /// # use rustc_middle::ty::TyCtxt;
-  /// # fn f<'tcx>(tcx: TyCtxt<'tcx>, params: PdgParams<'tcx>) -> PdgParams<'tcx> {
-  /// params.with_call_filter(move |f, _| {
-  ///   let name = tcx.opt_item_name(f.def_id());
-  ///   !matches!(name.as_ref().map(|sym| sym.as_str()), Some("no_inline"))
+  /// params.with_call_change_callback(|info| {
+  ///   let skip = if info.call_string.len() > THRESHOLD {
+  ///     SkipCall::Skip
+  ///   } else {
+  ///     SkipCall::NoSkip
+  ///   };
+  ///   CallChanges::default().with_skip(skip)
   /// })
   /// # }
   /// ```
-  pub fn with_call_filter(
+  pub fn with_call_change_callback(
     self,
-    f: impl Fn(FnResolution<'tcx>, CallString) -> bool + 'tcx,
+    f: impl Fn(CallInfo<'tcx>) -> CallChanges<'tcx> + 'tcx,
   ) -> Self {
     PdgParams {
-      call_filter: Some(Rc::new(Box::new(f))),
-      ..self
-    }
-  }
-
-  /// Enable PDG generation to insert false edges to mutable references passed to function calls.
-  ///
-  /// This is a special case used by Paralegal.
-  pub fn with_false_call_edges(self) -> Self {
-    PdgParams {
-      false_call_edges: true,
+      call_change_callback: Some(Rc::new(Box::new(f))),
       ..self
     }
   }
 }
 
-#[derive(PartialEq, Eq, Default, Clone)]
+#[derive(PartialEq, Eq, Default, Clone, Debug)]
 pub struct PartialGraph<'tcx> {
+  nodes: FxHashSet<DepNode<'tcx>>,
   edges: FxHashSet<(DepNode<'tcx>, DepNode<'tcx>, DepEdge)>,
   last_mutation: FxHashMap<Place<'tcx>, FxHashSet<RichLocation>>,
 }
 
+impl<C> DebugWithContext<C> for PartialGraph<'_> {}
+
 impl<'tcx> df::JoinSemiLattice for PartialGraph<'tcx> {
   fn join(&mut self, other: &Self) -> bool {
     let b1 = utils::hashset_join(&mut self.edges, &other.edges);
-    let b2 = utils::hashmap_join(
+    let b2 = utils::hashset_join(&mut self.nodes, &other.nodes);
+    let b3 = utils::hashmap_join(
       &mut self.last_mutation,
       &other.last_mutation,
       utils::hashset_join,
     );
-    b1 || b2
+    b1 || b2 || b3
   }
 }
 
@@ -423,6 +479,11 @@ impl<'tcx> GraphConstructor<'tcx> {
     };
     trace!("  Outputs: {outputs:?}");
 
+    for output in &outputs {
+      trace!("Adding node {output:?}");
+      state.nodes.insert(*output);
+    }
+
     // Add data dependencies: data_input -> output
     let data_edge = DepEdge::data(self.make_call_string(location));
     for data_input in data_inputs {
@@ -597,35 +658,6 @@ impl<'tcx> GraphConstructor<'tcx> {
     };
     trace!("  Handling call!");
 
-    let call_string = self.make_call_string(location);
-    if let Some(call_filter) = &self.params.call_filter {
-      if !call_filter(resolved_fn, call_string) {
-        trace!("  Bailing because user callback said to bail");
-        return None;
-      }
-    }
-
-    // Recursively generate the PDG for the child function.
-    let params = PdgParams {
-      root: resolved_fn,
-      ..self.params.clone()
-    };
-    let call_stack = match &self.calling_context {
-      Some(cx) => {
-        let mut stack = cx.call_stack.clone();
-        stack.push(resolved_def_id);
-        stack
-      }
-      None => vec![resolved_def_id],
-    };
-    let calling_context = CallingContext {
-      call_string,
-      param_env,
-      call_stack,
-    };
-    let child_constructor = GraphConstructor::new(params, Some(calling_context));
-    let child_graph = child_constructor.construct_partial();
-
     // A helper to translate an argument (or return) in the child into a place in the parent.
     let parent_body = &self.body;
     let translate_to_parent = |child: Place<'tcx>| -> Option<Place<'tcx>> {
@@ -679,6 +711,71 @@ impl<'tcx> GraphConstructor<'tcx> {
       ))
     };
 
+    let call_string = self.make_call_string(location);
+    // Recursively generate the PDG for the child function.
+    let params = PdgParams {
+      root: resolved_fn,
+      ..self.params.clone()
+    };
+    let call_stack = match &self.calling_context {
+      Some(cx) => {
+        let mut stack = cx.call_stack.clone();
+        stack.push(resolved_def_id);
+        stack
+      }
+      None => vec![resolved_def_id],
+    };
+    let calling_context = CallingContext {
+      call_string,
+      param_env,
+      call_stack,
+    };
+    let child_constructor = GraphConstructor::new(params, Some(calling_context));
+
+    if let Some(callback) = &self.params.call_change_callback {
+      let info = CallInfo {
+        callee: resolved_fn,
+        call_string,
+      };
+      let changes = callback(info);
+
+      for FakeEffect {
+        place: callee_place,
+        kind: cause,
+      } in changes.fake_effects
+      {
+        let caller_place = match translate_to_parent(callee_place) {
+          Some(place) => place,
+          None => continue,
+        };
+        match cause {
+          FakeEffectKind::Read => self.apply_mutation(
+            state,
+            location,
+            Either::Right(
+              child_constructor.make_dep_node(callee_place, RichLocation::Start),
+            ),
+            Either::Left(vec![caller_place]),
+            MutationStatus::Possibly,
+          ),
+          FakeEffectKind::Write => self.apply_mutation(
+            state,
+            location,
+            Either::Left(caller_place),
+            Either::Left(vec![caller_place]),
+            MutationStatus::Possibly,
+          ),
+        };
+      }
+
+      if matches!(changes.skip, SkipCall::Skip) {
+        trace!("  Bailing because user callback said to bail");
+        return None;
+      }
+    }
+
+    let child_graph = child_constructor.construct_partial();
+
     // Find every reference to a parent-able node in the child's graph.
     let is_arg = |node: &DepNode<'tcx>| {
       node.at.leaf().function == child_constructor.def_id
@@ -697,26 +794,6 @@ impl<'tcx> GraphConstructor<'tcx> {
       .map(|(_, dst, _)| *dst)
       .filter(is_arg)
       .filter(|node| node.at.leaf().location.is_end());
-
-    if self.params.false_call_edges {
-      for arg in args {
-        if let Some(place) = arg.place() {
-          for mut_ref in self.place_info.reachable_values(place, Mutability::Mut) {
-            if mut_ref.ty(&parent_body.local_decls, tcx).ty.is_ref() {
-              debug!("false mutation");
-              let mutated = tcx.mk_place_deref(*mut_ref);
-              self.apply_mutation(
-                state,
-                location,
-                Either::Left(mutated),
-                Either::Left(vec![mutated]),
-                MutationStatus::Possibly,
-              );
-            }
-          }
-        }
-      }
-    }
 
     // For each source node CHILD that is parentable to PLACE,
     // add an edge from PLACE -> CHILD.
@@ -749,77 +826,12 @@ impl<'tcx> GraphConstructor<'tcx> {
       }
     }
 
+    state.nodes.extend(child_graph.nodes);
     state.edges.extend(child_graph.edges);
 
     trace!("  Inlined {}", self.fmt_fn(resolved_def_id));
 
     Some(())
-  }
-
-  fn visit_basic_block(&self, block: BasicBlock, state: &mut PartialGraph<'tcx>) {
-    macro_rules! visitor {
-      () => {
-        ModularMutationVisitor::new(&self.place_info, |location, mutations| {
-          for mutation in mutations {
-            self.apply_mutation(
-              state,
-              location,
-              Either::Left(mutation.mutated),
-              Either::Left(mutation.inputs),
-              mutation.status,
-            );
-          }
-        })
-      };
-    }
-
-    // For each statement, register any mutations contained in the statement.
-    let block_data = &&self.body.basic_blocks[block];
-    for (statement_index, statement) in block_data.statements.iter().enumerate() {
-      let location = Location {
-        statement_index,
-        block,
-      };
-
-      visitor!().visit_statement(statement, location);
-    }
-
-    let terminator = self.body.basic_blocks[block].terminator();
-    let terminator_loc = self.body.terminator_loc(block);
-    match &terminator.kind {
-      // Special case: if the current block is a SwitchInt, then other blocks could be control-dependent on it.
-      // We need to create a node for the value of the discriminant at this point, so control-dependent mutations
-      // can use it as a source.
-      TerminatorKind::SwitchInt { discr, .. } => {
-        if let Some(place) = discr.place() {
-          self.apply_mutation(
-            state,
-            terminator_loc,
-            Either::Left(place),
-            Either::Left(vec![place]),
-            MutationStatus::Possibly,
-          );
-        }
-      }
-
-      // Special case: need to deal with context-sensitivity for function calls.
-      TerminatorKind::Call {
-        func,
-        args,
-        destination,
-        ..
-      } => {
-        if self
-          .handle_call(state, terminator_loc, func, args, *destination)
-          .is_none()
-        {
-          visitor!().visit_terminator(terminator, terminator_loc)
-        }
-      }
-
-      // Fallback: call the visitor
-      _ => visitor!().visit_terminator(terminator, terminator_loc),
-    }
   }
 
   fn async_generator(body: &Body<'tcx>) -> (LocalDefId, GenericArgsRef<'tcx>, Location) {
@@ -839,6 +851,70 @@ impl<'tcx> GraphConstructor<'tcx> {
       panic!("Async fn should assign to a generator")
     };
     (def_id.expect_local(), generic_args, location)
+  }
+
+  fn modular_mutation_visitor<'a>(
+    &'a self,
+    state: &'a mut PartialGraph<'tcx>,
+  ) -> ModularMutationVisitor<'a, 'tcx, impl FnMut(Location, Vec<Mutation<'tcx>>) + 'a>
+  {
+    ModularMutationVisitor::new(&self.place_info, |location, mutations| {
+      for mutation in mutations {
+        self.apply_mutation(
+          state,
+          location,
+          Either::Left(mutation.mutated),
+          Either::Left(mutation.inputs),
+          mutation.status,
+        );
+      }
+    })
+  }
+
+  fn handle_terminator(
+    &self,
+    terminator: &Terminator<'tcx>,
+    state: &mut PartialGraph<'tcx>,
+    location: Location,
+  ) {
+    match &terminator.kind {
+      // Special case: if the current block is a SwitchInt, then other blocks could be control-dependent on it.
+      // We need to create a node for the value of the discriminant at this point, so control-dependent mutations
+      // can use it as a source.
+      TerminatorKind::SwitchInt { discr, .. } => {
+        if let Some(place) = discr.place() {
+          self.apply_mutation(
+            state,
+            location,
+            Either::Left(place),
+            Either::Left(vec![place]),
+            MutationStatus::Possibly,
+          );
+        }
+      }
+
+      // Special case: need to deal with context-sensitivity for function calls.
+      TerminatorKind::Call {
+        func,
+        args,
+        destination,
+        ..
+      } => {
+        if self
+          .handle_call(state, location, func, args, *destination)
+          .is_none()
+        {
+          self
+            .modular_mutation_visitor(state)
+            .visit_terminator(terminator, location)
+        }
+      }
+
+      // Fallback: call the visitor
+      _ => self
+        .modular_mutation_visitor(state)
+        .visit_terminator(terminator, location),
+    }
   }
 
   fn construct_partial(&self) -> PartialGraph<'tcx> {
@@ -868,23 +944,12 @@ impl<'tcx> GraphConstructor<'tcx> {
       return GraphConstructor::new(params, Some(calling_context)).construct_partial();
     }
 
-    let bb_graph = &self.body.basic_blocks;
-    let blocks =
-      rustc_graph::iterate::reverse_post_order(bb_graph, bb_graph.start_node());
+    let mut analysis = DfAnalysis(self)
+      .into_engine(self.tcx, &self.body)
+      .iterate_to_fixpoint()
+      .into_results_cursor(&self.body);
 
-    let empty = PartialGraph::default();
-    let mut domains = IndexVec::from_elem_n(empty.clone(), bb_graph.len());
-    for block in blocks {
-      for parent in bb_graph.predecessors()[block].iter() {
-        let (child, parent) = domains.pick2_mut(block, *parent);
-        child.join(parent);
-      }
-
-      self.visit_basic_block(block, &mut domains[block]);
-    }
-
-    let mut final_state = empty;
-
+    let mut final_state = PartialGraph::default();
     let all_returns = self.body.all_returns().map(|ret| ret.block).collect_vec();
     let has_return = !all_returns.is_empty();
     let blocks = if has_return {
@@ -893,12 +958,14 @@ impl<'tcx> GraphConstructor<'tcx> {
       self.body.basic_blocks.indices().collect_vec()
     };
     for block in blocks {
-      final_state.join(&domains[block]);
+      analysis.seek_to_block_end(block);
+      final_state.join(analysis.get());
     }
 
     if has_return {
       for block in all_returns {
-        let return_state = &domains[block];
+        analysis.seek_to_block_end(block);
+        let return_state = analysis.get();
         for (place, locations) in &return_state.last_mutation {
           if place.local == RETURN_PLACE || place.is_arg(&self.body) {
             for location in locations {
@@ -924,6 +991,11 @@ impl<'tcx> GraphConstructor<'tcx> {
         *nodes.entry($n).or_insert_with(|| graph.add_node($n))
       };
     }
+
+    for node in domain.nodes {
+      let _ = add_node!(node);
+    }
+
     for (src, dst, kind) in domain.edges {
       let src_idx = add_node!(src);
       let dst_idx = add_node!(dst);
@@ -936,5 +1008,51 @@ impl<'tcx> GraphConstructor<'tcx> {
   pub fn construct(self) -> DepGraph<'tcx> {
     let partial = self.construct_partial();
     self.domain_to_petgraph(partial)
+  }
+}
+
+struct DfAnalysis<'a, 'tcx>(&'a GraphConstructor<'tcx>);
+
+impl<'tcx> df::AnalysisDomain<'tcx> for DfAnalysis<'_, 'tcx> {
+  type Domain = PartialGraph<'tcx>;
+
+  const NAME: &'static str = "GraphConstructor";
+
+  fn bottom_value(&self, _body: &Body<'tcx>) -> Self::Domain {
+    PartialGraph::default()
+  }
+
+  fn initialize_start_block(&self, _body: &Body<'tcx>, _state: &mut Self::Domain) {}
+}
+
+impl<'tcx> df::Analysis<'tcx> for DfAnalysis<'_, 'tcx> {
+  fn apply_statement_effect(
+    &mut self,
+    state: &mut Self::Domain,
+    statement: &Statement<'tcx>,
+    location: Location,
+  ) {
+    self
+      .0
+      .modular_mutation_visitor(state)
+      .visit_statement(statement, location)
+  }
+
+  fn apply_terminator_effect<'mir>(
+    &mut self,
+    state: &mut Self::Domain,
+    terminator: &'mir Terminator<'tcx>,
+    location: Location,
+  ) -> TerminatorEdges<'mir, 'tcx> {
+    self.0.handle_terminator(terminator, state, location);
+    terminator.edges()
+  }
+
+  fn apply_call_return_effect(
+    &mut self,
+    _state: &mut Self::Domain,
+    _block: BasicBlock,
+    _return_places: rustc_middle::mir::CallReturnPlaces<'_, 'tcx>,
+  ) {
   }
 }
