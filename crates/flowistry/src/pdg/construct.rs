@@ -21,7 +21,6 @@ use rustc_middle::{
   ty::{GenericArg, GenericArgsRef, List, ParamEnv, TyCtxt, TyKind},
 };
 use rustc_mir_dataflow::{self as df};
-use rustc_span::sym::poll;
 use rustc_utils::{
   mir::{borrowck_facts, control_dependencies::ControlDependencies},
   BodyExt, PlaceExt,
