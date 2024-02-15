@@ -51,6 +51,15 @@ impl<'tcx> FnResolution<'tcx> {
   }
 }
 
+impl<'tcx> std::fmt::Display for FnResolution<'tcx> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      FnResolution::Final(sub) => std::fmt::Debug::fmt(sub, f),
+      FnResolution::Partial(p) => std::fmt::Debug::fmt(p, f),
+    }
+  }
+}
+
 /// Try and normalize the provided generics.
 ///
 /// The purpose of this function is to test whether resolving these generics

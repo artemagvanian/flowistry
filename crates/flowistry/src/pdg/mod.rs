@@ -1,5 +1,7 @@
 //! Compute program dependence graphs (PDG) for a function call graph.
 
+pub use utils::FnResolution;
+
 use self::graph::DepGraph;
 use crate::pdg::construct::GraphConstructor;
 pub use crate::pdg::construct::{
