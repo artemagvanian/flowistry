@@ -537,7 +537,7 @@ impl<'tcx> GraphConstructor<'tcx> {
   fn find_async_args<'a>(
     &'a self,
     args: &'a [Operand<'tcx>],
-  ) -> Option<&'a [Operand<'tcx>]> {
+  ) -> Option<(FnResolution<'tcx>, Location, &'a [Operand<'tcx>])> {
     let get_def_for_op = |op: &Operand<'tcx>| -> Option<Location> {
       trylet!(Some(place) = op.place(), "Arg is not a place");
       trylet!(Some(local) = place.as_local(), "Place is not a local");
@@ -586,15 +586,25 @@ impl<'tcx> GraphConstructor<'tcx> {
       "Assignment to alias of pin::new input is not a call"
     );
 
+    let async_fn_call_loc = get_def_for_op(&into_future_args[0])?;
     trylet!(
       Either::Right(Terminator {
-        kind: TerminatorKind::Call { args, .. },
+        kind: TerminatorKind::Call { args, func, .. },
         ..
-      }) = &self.body.stmt_at(get_def_for_op(&into_future_args[0])?),
+      }) = &self.body.stmt_at(async_fn_call_loc),
       "Assignment to into_future input is not a call"
     );
 
-    Some(args)
+    let (op, generics) = self.operand_to_def_id(func)?;
+
+    let resolution = utils::try_resolve_function(
+      self.tcx,
+      op,
+      self.tcx.param_env(self.def_id),
+      generics,
+    );
+
+    Some((resolution, async_fn_call_loc, args))
   }
 
   /// Resolve a function [`Operand`] to a specific [`DefId`] and generic arguments if possible.
@@ -639,12 +649,6 @@ impl<'tcx> GraphConstructor<'tcx> {
     let (called_def_id, generic_args) = self.operand_to_def_id(func)?;
     trace!("Resolved call to function: {}", self.fmt_fn(called_def_id));
 
-    // Handle async functions at the time of polling, not when the future is created.
-    if tcx.asyncness(called_def_id).is_async() {
-      trace!("  Bailing because func is async");
-      return Some(());
-    }
-
     // Monomorphize the called function with the known generic_args.
     let param_env = tcx.param_env(self.def_id);
     let resolved_fn =
@@ -663,20 +667,20 @@ impl<'tcx> GraphConstructor<'tcx> {
       }
     }
 
-    enum CallKind {
+    enum CallKind<'tcx> {
       /// A standard function call like `f(x)`.
       Direct,
       /// A call to a function variable, like `fn foo(f: impl Fn()) { f() }`
       Indirect,
       /// A poll to an async function, like `f.await`.
-      AsyncPoll,
+      AsyncPoll(FnResolution<'tcx>, Location),
     }
     // Determine the type of call-site.
     let (call_kind, args) = match tcx.def_path_str(called_def_id).as_str() {
       "std::ops::Fn::call" => (CallKind::Indirect, args),
       "std::future::Future::poll" => {
-        let args = self.find_async_args(args)?;
-        (CallKind::AsyncPoll, args)
+        let (fun, loc, args) = self.find_async_args(args)?;
+        (CallKind::AsyncPoll(fun, loc), args)
       }
       def_path => {
         if resolved_def_id.is_local() {
@@ -693,9 +697,9 @@ impl<'tcx> GraphConstructor<'tcx> {
     let parent_body = &self.body;
     let translate_to_parent = |child: Place<'tcx>| -> Option<Place<'tcx>> {
       trace!("  Translating child place: {child:?}");
-      let (parent_place, child_projection) = match call_kind {
+      let (parent_place, child_projection) = match &call_kind {
         // Async return must be handled special, because it gets wrapped in `Poll::Ready`
-        CallKind::AsyncPoll if child.local == RETURN_PLACE => {
+        CallKind::AsyncPoll { .. } if child.local == RETURN_PLACE => {
           let async_info = self.async_info.as_ref();
           let in_poll = destination.project_deeper(
             &[PlaceElem::Downcast(None, async_info.poll_ready_variant_idx)],
@@ -720,7 +724,7 @@ impl<'tcx> GraphConstructor<'tcx> {
           &child.projection[..],
         ),
         // Map arguments to projections of the future, the poll's first argument
-        CallKind::AsyncPoll => {
+        CallKind::AsyncPoll { .. } => {
           if child.local.as_usize() == 1 {
             let PlaceElem::Field(idx, _) = child.projection[0] else {
               panic!("Unexpected non-projection of async context")
@@ -777,16 +781,50 @@ impl<'tcx> GraphConstructor<'tcx> {
       param_env,
       call_stack,
     };
+
+    let call_changes = self.params.call_change_callback.as_ref().map(|callback| {
+      let info = if let CallKind::AsyncPoll(resolution, loc) = call_kind {
+        // Special case for async. We ask for skipping not on the closure, but
+        // on the "async" function that created it. This is needed for
+        // consistency in skipping. Normally, when "poll" is inlined, mutations
+        // introduced by the creator of the future are not recorded and instead
+        // handled here, on the closure. But if the closure is skipped we need
+        // those mutations to occur. To ensure this we always ask for the
+        // "CallChanges" on the creator so that both creator and closure have
+        // the same view of whether they are inlined or "Skip"ped.
+        CallInfo {
+          callee: resolution,
+          call_string: self.make_call_string(loc),
+        }
+      } else {
+        CallInfo {
+          callee: resolved_fn,
+          call_string,
+        }
+      };
+      callback(info)
+    });
+
+    // Handle async functions at the time of polling, not when the future is created.
+    if tcx.asyncness(called_def_id).is_async() {
+      trace!("  Bailing because func is async");
+      // If a skip was requested then "poll" will not be inlined later so we
+      // bail with "None" here and perform the mutations. Otherwise we bail with
+      // "Some", knowing that handling "poll" later will handle the mutations.
+      return (!matches!(
+        &call_changes,
+        Some(CallChanges {
+          skip: SkipCall::Skip,
+          ..
+        })
+      ))
+      .then_some(());
+    }
+
     let child_constructor =
       GraphConstructor::new(params, Some(calling_context), self.async_info.clone());
 
-    if let Some(callback) = &self.params.call_change_callback {
-      let info = CallInfo {
-        callee: resolved_fn,
-        call_string,
-      };
-      let changes = callback(info);
-
+    if let Some(changes) = call_changes {
       for FakeEffect {
         place: callee_place,
         kind: cause,
