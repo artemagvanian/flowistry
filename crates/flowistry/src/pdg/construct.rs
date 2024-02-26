@@ -675,21 +675,19 @@ impl<'tcx> GraphConstructor<'tcx> {
       /// A poll to an async function, like `f.await`.
       AsyncPoll(FnResolution<'tcx>, Location),
     }
+    let def_path = tcx.def_path_str(called_def_id);
+    if !resolved_def_id.is_local() {
+      trace!("  Bailing because func is non-local: `{def_path}`");
+      return None;
+    }
     // Determine the type of call-site.
-    let (call_kind, args) = match tcx.def_path_str(called_def_id).as_str() {
+    let (call_kind, args) = match def_path.as_str() {
       "std::ops::Fn::call" => (CallKind::Indirect, args),
       "std::future::Future::poll" => {
         let (fun, loc, args) = self.find_async_args(args)?;
         (CallKind::AsyncPoll(fun, loc), args)
       }
-      def_path => {
-        if resolved_def_id.is_local() {
-          (CallKind::Direct, args)
-        } else {
-          trace!("  Bailing because func is non-local: `{def_path}`");
-          return None;
-        }
-      }
+      _ => (CallKind::Direct, args),
     };
     trace!("  Handling call!");
 
