@@ -819,6 +819,17 @@ impl<'tcx> GraphConstructor<'tcx> {
       .then_some(());
     }
 
+    if matches!(
+      call_changes,
+      Some(CallChanges {
+        skip: SkipCall::Skip,
+        ..
+      })
+    ) {
+      trace!("  Bailing because user callback said to bail");
+      return None;
+    }
+
     let child_constructor =
       GraphConstructor::new(params, Some(calling_context), self.async_info.clone());
 
@@ -848,11 +859,6 @@ impl<'tcx> GraphConstructor<'tcx> {
             Either::Left(vec![caller_place]),
           ),
         };
-      }
-
-      if matches!(changes.skip, SkipCall::Skip) {
-        trace!("  Bailing because user callback said to bail");
-        return None;
       }
     }
 
