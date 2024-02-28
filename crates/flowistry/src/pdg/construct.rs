@@ -689,7 +689,11 @@ impl<'tcx> GraphConstructor<'tcx> {
       }
       _ => (CallKind::Direct, args),
     };
-    trace!("  Handling call!");
+    trace!("  Handling call! with kind {}", match &call_kind {
+      CallKind::Direct => "direct",
+      CallKind::Indirect => "indirect",
+      CallKind::AsyncPoll { .. } => "async poll",
+    });
 
     // A helper to translate an argument (or return) in the child into a place in the parent.
     let parent_body = &self.body;
@@ -1040,7 +1044,6 @@ impl<'tcx> GraphConstructor<'tcx> {
         })
         .collect::<Vec<_>>();
       assert_eq!(matching_statements.len(), 1);
-      println!("Found an async trait function in {:?}", self.def_id);
       matching_statements.pop()
     } else {
       None
