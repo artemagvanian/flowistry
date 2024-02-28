@@ -667,28 +667,20 @@ impl<'tcx> GraphConstructor<'tcx> {
       }
     }
 
-    enum CallKind<'tcx> {
-      /// A standard function call like `f(x)`.
-      Direct,
-      /// A call to a function variable, like `fn foo(f: impl Fn()) { f() }`
-      Indirect,
-      /// A poll to an async function, like `f.await`.
-      AsyncPoll(FnResolution<'tcx>, Location),
-    }
-    let def_path = tcx.def_path_str(called_def_id);
-    if !resolved_def_id.is_local() {
-      trace!("  Bailing because func is non-local: `{def_path}`");
+    let Some(call_kind) = self.classify_call_kind(called_def_id, args) else {
+      trace!(
+        "  Bailing because func is non-local: `{}`",
+        tcx.def_path_str(called_def_id)
+      );
       return None;
-    }
-    // Determine the type of call-site.
-    let (call_kind, args) = match def_path.as_str() {
-      "std::ops::Fn::call" => (CallKind::Indirect, args),
-      "std::future::Future::poll" => {
-        let (fun, loc, args) = self.find_async_args(args)?;
-        (CallKind::AsyncPoll(fun, loc), args)
-      }
-      _ => (CallKind::Direct, args),
     };
+
+    let args = if let CallKind::AsyncPoll(_, _, args) = &call_kind {
+      *args
+    } else {
+      args
+    };
+
     trace!("  Handling call! with kind {}", match &call_kind {
       CallKind::Direct => "direct",
       CallKind::Indirect => "indirect",
@@ -785,7 +777,7 @@ impl<'tcx> GraphConstructor<'tcx> {
     };
 
     let call_changes = self.params.call_change_callback.as_ref().map(|callback| {
-      let info = if let CallKind::AsyncPoll(resolution, loc) = call_kind {
+      let info = if let CallKind::AsyncPoll(resolution, loc, _) = call_kind {
         // Special case for async. We ask for skipping not on the closure, but
         // on the "async" function that created it. This is needed for
         // consistency in skipping. Normally, when "poll" is inlined, mutations
@@ -1146,6 +1138,29 @@ impl<'tcx> GraphConstructor<'tcx> {
     let partial = self.construct_partial();
     self.domain_to_petgraph(partial)
   }
+
+  /// Determine the type of call-site.
+  fn classify_call_kind<'a>(
+    &'a self,
+    def_id: DefId,
+    original_args: &'a [Operand<'tcx>],
+  ) -> Option<CallKind<'tcx, 'a>> {
+    let tcx = self.tcx;
+    let lang_items = tcx.lang_items();
+    if lang_items.future_poll_fn() == Some(def_id) {
+      let (fun, loc, args) = self.find_async_args(original_args)?;
+      return Some(CallKind::AsyncPoll(fun, loc, args));
+    }
+    let my_impl = tcx.impl_of_method(def_id)?;
+    let my_trait = tcx.trait_id_of_impl(my_impl)?;
+    if Some(my_trait) == lang_items.fn_trait()
+      || Some(my_trait) == lang_items.fn_mut_trait()
+      || Some(my_trait) == lang_items.fn_once_trait()
+    {
+      return Some(CallKind::Indirect);
+    }
+    def_id.is_local().then_some(CallKind::Direct)
+  }
 }
 
 use rustc_middle::ty;
@@ -1175,6 +1190,15 @@ fn match_pin_box_dyn_ty(lang_items: &rustc_hir::LanguageItems, t: ty::Ty) -> boo
     };
     Some(t.def_id) == lang_items.future_trait()
   })
+}
+
+enum CallKind<'tcx, 'a> {
+  /// A standard function call like `f(x)`.
+  Direct,
+  /// A call to a function variable, like `fn foo(f: impl Fn()) { f() }`
+  Indirect,
+  /// A poll to an async function, like `f.await`.
+  AsyncPoll(FnResolution<'tcx>, Location, &'a [Operand<'tcx>]),
 }
 
 struct DfAnalysis<'a, 'tcx>(&'a GraphConstructor<'tcx>);
