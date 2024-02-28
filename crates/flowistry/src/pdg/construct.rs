@@ -995,9 +995,54 @@ impl<'tcx> GraphConstructor<'tcx> {
     }
   }
 
-  fn construct_partial(&self) -> PartialGraph<'tcx> {
+  fn determine_async(&self) -> Option<(LocalDefId, GenericArgsRef<'tcx>, Location)> {
     if self.tcx.asyncness(self.def_id).is_async() {
-      let (generator_def_id, generic_args, location) = Self::async_generator(&self.body);
+      Some(Self::async_generator(&self.body))
+    } else if {
+      if let Some(assoc_item) = self.tcx.opt_associated_item(self.def_id.to_def_id()) {
+        let sig = self.tcx.fn_sig(self.def_id).skip_binder();
+        assoc_item.container == ty::AssocItemContainer::ImplContainer
+          && assoc_item.trait_item_def_id.is_some()
+          && match_pin_box_dyn_ty(self.tcx.lang_items(), sig.output().skip_binder())
+      } else {
+        false
+      }
+    } {
+      let mut matching_statements = self
+        .body
+        .basic_blocks
+        .iter_enumerated()
+        .flat_map(|(block, bbdat)| {
+          bbdat.statements.iter().enumerate().filter_map(
+            move |(statement_index, statement)| {
+              let StatementKind::Assign(box (
+                _,
+                Rvalue::Aggregate(
+                  box AggregateKind::Generator(def_id, generic_args, _),
+                  _args,
+                ),
+              )) = &statement.kind
+              else {
+                return None;
+              };
+              Some((def_id.as_local()?, *generic_args, Location {
+                block,
+                statement_index,
+              }))
+            },
+          )
+        })
+        .collect::<Vec<_>>();
+      assert_eq!(matching_statements.len(), 1);
+      println!("Found an async trait function in {:?}", self.def_id);
+      matching_statements.pop()
+    } else {
+      None
+    }
+  }
+
+  fn construct_partial(&self) -> PartialGraph<'tcx> {
+    if let Some((generator_def_id, generic_args, location)) = self.determine_async() {
       let param_env = self.tcx.param_env(self.def_id);
       let generator_fn = utils::try_resolve_function(
         self.tcx,
@@ -1092,6 +1137,35 @@ impl<'tcx> GraphConstructor<'tcx> {
     let partial = self.construct_partial();
     self.domain_to_petgraph(partial)
   }
+}
+
+use rustc_middle::ty;
+fn match_pin_box_dyn_ty(lang_items: &rustc_hir::LanguageItems, t: ty::Ty) -> bool {
+  let ty::TyKind::Adt(pin_ty, args) = t.kind() else {
+    return false;
+  };
+  if Some(pin_ty.did()) != lang_items.pin_type() {
+    return false;
+  };
+  let [arg] = args.as_slice() else { return false };
+  let Some(t_a) = arg.as_type() else {
+    return false;
+  };
+  if !t_a.is_box() {
+    return false;
+  };
+  let ty::TyKind::Dynamic(pred, _, ty::DynKind::Dyn) = t_a.boxed_ty().kind() else {
+    return false;
+  };
+  if pred.len() != 2 {
+    return false;
+  }
+  pred.iter().any(|p| {
+    let ty::ExistentialPredicate::Trait(t) = p.skip_binder() else {
+      return false;
+    };
+    Some(t.def_id) == lang_items.future_trait()
+  })
 }
 
 struct DfAnalysis<'a, 'tcx>(&'a GraphConstructor<'tcx>);
