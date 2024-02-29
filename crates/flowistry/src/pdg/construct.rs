@@ -667,7 +667,13 @@ impl<'tcx> GraphConstructor<'tcx> {
       }
     }
 
-    let Some(call_kind) = self.classify_call_kind(called_def_id, args) else {
+    let call_kind = self.classify_call_kind(called_def_id, args);
+
+    let actual_call_target = match &call_kind {
+      CallKind::AsyncPoll(resolution, ..) => resolution.def_id(),
+      _ => called_def_id,
+    };
+    if !actual_call_target.is_local() {
       trace!(
         "  Bailing because func is non-local: `{}`",
         tcx.def_path_str(called_def_id)
@@ -1144,23 +1150,37 @@ impl<'tcx> GraphConstructor<'tcx> {
     &'a self,
     def_id: DefId,
     original_args: &'a [Operand<'tcx>],
+  ) -> CallKind<'tcx, 'a> {
+    self
+      .try_poll_call_kind(def_id, original_args)
+      .or_else(|| self.try_indirect_call_kind(def_id))
+      .unwrap_or(CallKind::Direct)
+  }
+
+  fn try_indirect_call_kind(&self, def_id: DefId) -> Option<CallKind<'tcx, '_>> {
+    let lang_items = self.tcx.lang_items();
+    let my_impl = self.tcx.impl_of_method(def_id)?;
+    let my_trait = self.tcx.trait_id_of_impl(my_impl)?;
+    (Some(my_trait) == lang_items.fn_trait()
+      || Some(my_trait) == lang_items.fn_mut_trait()
+      || Some(my_trait) == lang_items.fn_once_trait())
+    .then_some(CallKind::Indirect)
+  }
+
+  fn try_poll_call_kind<'a>(
+    &'a self,
+    def_id: DefId,
+    original_args: &'a [Operand<'tcx>],
   ) -> Option<CallKind<'tcx, 'a>> {
-    let tcx = self.tcx;
-    let lang_items = tcx.lang_items();
+    let lang_items = self.tcx.lang_items();
     if lang_items.future_poll_fn() == Some(def_id) {
       let (fun, loc, args) = self.find_async_args(original_args)?;
-      return Some(CallKind::AsyncPoll(fun, loc, args));
+      Some(CallKind::AsyncPoll(fun, loc, args))
+    } else {
+      None
     }
-    let my_impl = tcx.impl_of_method(def_id)?;
-    let my_trait = tcx.trait_id_of_impl(my_impl)?;
-    if Some(my_trait) == lang_items.fn_trait()
-      || Some(my_trait) == lang_items.fn_mut_trait()
-      || Some(my_trait) == lang_items.fn_once_trait()
-    {
-      return Some(CallKind::Indirect);
-    }
-    def_id.is_local().then_some(CallKind::Direct)
   }
+}
 }
 
 use rustc_middle::ty;
