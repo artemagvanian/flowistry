@@ -5,7 +5,8 @@ pub use utils::FnResolution;
 use self::graph::DepGraph;
 use crate::pdg::construct::GraphConstructor;
 pub use crate::pdg::construct::{
-  CallChanges, CallInfo, FakeEffect, FakeEffectKind, PdgParams, SkipCall,
+  is_async_trait_fn, CallChanges, CallInfo, FakeEffect, FakeEffectKind, PdgParams,
+  SkipCall,
 };
 
 mod construct;

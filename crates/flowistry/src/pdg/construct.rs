@@ -1006,45 +1006,8 @@ impl<'tcx> GraphConstructor<'tcx> {
   fn determine_async(&self) -> Option<(LocalDefId, GenericArgsRef<'tcx>, Location)> {
     if self.tcx.asyncness(self.def_id).is_async() {
       Some(Self::async_generator(&self.body))
-    } else if {
-      if let Some(assoc_item) = self.tcx.opt_associated_item(self.def_id.to_def_id()) {
-        let sig = self.tcx.fn_sig(self.def_id).skip_binder();
-        assoc_item.container == ty::AssocItemContainer::ImplContainer
-          && assoc_item.trait_item_def_id.is_some()
-          && match_pin_box_dyn_ty(self.tcx.lang_items(), sig.output().skip_binder())
-      } else {
-        false
-      }
-    } {
-      let mut matching_statements = self
-        .body
-        .basic_blocks
-        .iter_enumerated()
-        .flat_map(|(block, bbdat)| {
-          bbdat.statements.iter().enumerate().filter_map(
-            move |(statement_index, statement)| {
-              let StatementKind::Assign(box (
-                _,
-                Rvalue::Aggregate(
-                  box AggregateKind::Generator(def_id, generic_args, _),
-                  _args,
-                ),
-              )) = &statement.kind
-              else {
-                return None;
-              };
-              Some((def_id.as_local()?, *generic_args, Location {
-                block,
-                statement_index,
-              }))
-            },
-          )
-        })
-        .collect::<Vec<_>>();
-      assert_eq!(matching_statements.len(), 1);
-      matching_statements.pop()
     } else {
-      None
+      try_as_async_trait_function(self.tcx, self.def_id.to_def_id(), self.body.as_ref())
     }
   }
 
@@ -1181,6 +1144,56 @@ impl<'tcx> GraphConstructor<'tcx> {
     }
   }
 }
+
+fn has_async_trait_signature(tcx: TyCtxt, def_id: DefId) -> bool {
+  if let Some(assoc_item) = tcx.opt_associated_item(def_id) {
+    let sig = tcx.fn_sig(def_id).skip_binder();
+    assoc_item.container == ty::AssocItemContainer::ImplContainer
+      && assoc_item.trait_item_def_id.is_some()
+      && match_pin_box_dyn_ty(tcx.lang_items(), sig.output().skip_binder())
+  } else {
+    false
+  }
+}
+
+fn try_as_async_trait_function<'tcx>(
+  tcx: TyCtxt,
+  def_id: DefId,
+  body: &Body<'tcx>,
+) -> Option<(LocalDefId, GenericArgsRef<'tcx>, Location)> {
+  if !has_async_trait_signature(tcx, def_id) {
+    return None;
+  }
+  let mut matching_statements = body
+    .basic_blocks
+    .iter_enumerated()
+    .flat_map(|(block, bbdat)| {
+      bbdat.statements.iter().enumerate().filter_map(
+        move |(statement_index, statement)| {
+          let StatementKind::Assign(box (
+            _,
+            Rvalue::Aggregate(
+              box AggregateKind::Generator(def_id, generic_args, _),
+              _args,
+            ),
+          )) = &statement.kind
+          else {
+            return None;
+          };
+          Some((def_id.as_local()?, *generic_args, Location {
+            block,
+            statement_index,
+          }))
+        },
+      )
+    })
+    .collect::<Vec<_>>();
+  assert_eq!(matching_statements.len(), 1);
+  matching_statements.pop()
+}
+
+pub fn is_async_trait_fn<'tcx>(tcx: TyCtxt, def_id: DefId, body: &Body<'tcx>) -> bool {
+  try_as_async_trait_function(tcx, def_id, body).is_some()
 }
 
 use rustc_middle::ty;
