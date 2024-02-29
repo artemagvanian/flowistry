@@ -12,6 +12,7 @@ use rustc_borrowck::consumers::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_index::IndexSlice;
 use rustc_middle::{
   mir::{
     visit::Visitor, AggregateKind, BasicBlock, Body, HasLocalDecls, Location, Operand,
@@ -537,7 +538,11 @@ impl<'tcx> GraphConstructor<'tcx> {
   fn find_async_args<'a>(
     &'a self,
     args: &'a [Operand<'tcx>],
-  ) -> Option<(FnResolution<'tcx>, Location, &'a [Operand<'tcx>])> {
+  ) -> Option<(
+    FnResolution<'tcx>,
+    Location,
+    AsyncCallingConvention<'tcx, 'a>,
+  )> {
     let get_def_for_op = |op: &Operand<'tcx>| -> Option<Location> {
       trylet!(Some(place) = op.place(), "Arg is not a place");
       trylet!(Some(local) = place.as_local(), "Place is not a local");
@@ -586,16 +591,51 @@ impl<'tcx> GraphConstructor<'tcx> {
       "Assignment to alias of pin::new input is not a call"
     );
 
-    let async_fn_call_loc = get_def_for_op(&into_future_args[0])?;
-    trylet!(
-      Either::Right(Terminator {
-        kind: TerminatorKind::Call { args, func, .. },
-        ..
-      }) = &self.body.stmt_at(async_fn_call_loc),
-      "Assignment to into_future input is not a call"
-    );
+    let mut chase_target = Err(&into_future_args[0]);
 
-    let (op, generics) = self.operand_to_def_id(func)?;
+    while let Err(target) = chase_target {
+      let async_fn_call_loc = get_def_for_op(target)?;
+      let stmt = &self.body.stmt_at(async_fn_call_loc);
+      chase_target = match stmt {
+        Either::Right(Terminator {
+          kind: TerminatorKind::Call { args, func, .. },
+          ..
+        }) => {
+          let (op, generics) = self.operand_to_def_id(func)?;
+          Ok((
+            op,
+            generics,
+            AsyncCallingConvention::Fn(args),
+            async_fn_call_loc,
+          ))
+        }
+        Either::Left(Statement { kind, .. }) => match kind {
+          StatementKind::Assign(box (
+            _,
+            Rvalue::Aggregate(
+              box AggregateKind::Generator(def_id, generic_args, _),
+              args,
+            ),
+          )) => Ok((
+            *def_id,
+            *generic_args,
+            AsyncCallingConvention::Block(args),
+            async_fn_call_loc,
+          )),
+          StatementKind::Assign(box (_, Rvalue::Use(target))) => Err(target),
+          _ => {
+            trace!("Assignment to into_future input is not a call: {stmt:?}");
+            return None;
+          }
+        },
+        _ => {
+          trace!("Assignment to into_future input is not a call: {stmt:?}");
+          return None;
+        }
+      };
+    }
+
+    let (op, generics, calling_convention, async_fn_call_loc) = chase_target.ok()?;
 
     let resolution = utils::try_resolve_function(
       self.tcx,
@@ -604,7 +644,7 @@ impl<'tcx> GraphConstructor<'tcx> {
       generics,
     );
 
-    Some((resolution, async_fn_call_loc, args))
+    Some((resolution, async_fn_call_loc, calling_convention))
   }
 
   /// Resolve a function [`Operand`] to a specific [`DefId`] and generic arguments if possible.
@@ -681,11 +721,7 @@ impl<'tcx> GraphConstructor<'tcx> {
       return None;
     };
 
-    let args = if let CallKind::AsyncPoll(_, _, args) = &call_kind {
-      *args
-    } else {
-      args
-    };
+    let calling_convention = CallingConvention::from_call_kind(&call_kind, args);
 
     trace!("  Handling call! with kind {}", match &call_kind {
       CallKind::Direct => "direct",
@@ -697,60 +733,13 @@ impl<'tcx> GraphConstructor<'tcx> {
     let parent_body = &self.body;
     let translate_to_parent = |child: Place<'tcx>| -> Option<Place<'tcx>> {
       trace!("  Translating child place: {child:?}");
-      let (parent_place, child_projection) = match &call_kind {
-        // Async return must be handled special, because it gets wrapped in `Poll::Ready`
-        CallKind::AsyncPoll { .. } if child.local == RETURN_PLACE => {
-          let async_info = self.async_info.as_ref();
-          let in_poll = destination.project_deeper(
-            &[PlaceElem::Downcast(None, async_info.poll_ready_variant_idx)],
-            tcx,
-          );
-          let field_idx = async_info.poll_ready_field_idx;
-          let child_inner_return_type = in_poll
-            .ty(parent_body.local_decls(), tcx)
-            .field_ty(tcx, field_idx);
-          (
-            in_poll.project_deeper(
-              &[PlaceElem::Field(field_idx, child_inner_return_type)],
-              tcx,
-            ),
-            &child.projection[..],
-          )
-        }
-        _ if child.local == RETURN_PLACE => (destination, &child.projection[..]),
-        // Map arguments to the argument array
-        CallKind::Direct => (
-          args[child.local.as_usize() - 1].place()?,
-          &child.projection[..],
-        ),
-        // Map arguments to projections of the future, the poll's first argument
-        CallKind::AsyncPoll { .. } => {
-          if child.local.as_usize() == 1 {
-            let PlaceElem::Field(idx, _) = child.projection[0] else {
-              panic!("Unexpected non-projection of async context")
-            };
-            (args[idx.as_usize()].place()?, &child.projection[1 ..])
-          } else {
-            return None;
-          }
-        }
-        // Map closure captures to the first argument.
-        // Map formal parameters to the second argument.
-        CallKind::Indirect => {
-          if child.local.as_usize() == 1 {
-            (args[0].place()?, &child.projection[..])
-          } else {
-            let tuple_arg = args[1].place()?;
-            let _projection = child.projection.to_vec();
-            let field = FieldIdx::from_usize(child.local.as_usize() - 2);
-            let field_ty = tuple_arg.ty(parent_body.as_ref(), tcx).field_ty(tcx, field);
-            (
-              tuple_arg.project_deeper(&[PlaceElem::Field(field, field_ty)], tcx),
-              &child.projection[..],
-            )
-          }
-        }
-      };
+      let (parent_place, child_projection) = calling_convention.handle_translate(
+        &self.async_info,
+        self.tcx,
+        child,
+        destination,
+        &self.body,
+      )?;
 
       let parent_place_projected = parent_place.project_deeper(child_projection, tcx);
       trace!("    Translated to: {parent_place_projected:?}");
@@ -1192,6 +1181,7 @@ fn try_as_async_trait_function<'tcx>(
   matching_statements.pop()
 }
 
+/// Does this fucntion have a structure as created by the `#[async_trait]` macro
 pub fn is_async_trait_fn<'tcx>(tcx: TyCtxt, def_id: DefId, body: &Body<'tcx>) -> bool {
   try_as_async_trait_function(tcx, def_id, body).is_some()
 }
@@ -1231,7 +1221,111 @@ enum CallKind<'tcx, 'a> {
   /// A call to a function variable, like `fn foo(f: impl Fn()) { f() }`
   Indirect,
   /// A poll to an async function, like `f.await`.
-  AsyncPoll(FnResolution<'tcx>, Location, &'a [Operand<'tcx>]),
+  AsyncPoll(
+    FnResolution<'tcx>,
+    Location,
+    AsyncCallingConvention<'tcx, 'a>,
+  ),
+}
+
+enum CallingConvention<'tcx, 'a> {
+  Direct(&'a [Operand<'tcx>]),
+  Indirect {
+    closure_arg: &'a Operand<'tcx>,
+    tupled_arguments: &'a Operand<'tcx>,
+  },
+  Async(AsyncCallingConvention<'tcx, 'a>),
+}
+
+impl<'tcx, 'a> CallingConvention<'tcx, 'a> {
+  fn from_call_kind(
+    kind: &CallKind<'tcx, 'a>,
+    args: &'a [Operand<'tcx>],
+  ) -> CallingConvention<'tcx, 'a> {
+    match kind {
+      CallKind::AsyncPoll(_, _, args) => CallingConvention::Async(*args),
+      CallKind::Direct => CallingConvention::Direct(args),
+      CallKind::Indirect => CallingConvention::Indirect {
+        closure_arg: &args[0],
+        tupled_arguments: &args[1],
+      },
+    }
+  }
+
+  fn handle_translate(
+    &self,
+    async_info: &AsyncInfo,
+    tcx: TyCtxt<'tcx>,
+    child: Place<'tcx>,
+    destination: Place<'tcx>,
+    parent_body: &Body<'tcx>,
+  ) -> Option<(Place<'tcx>, &[PlaceElem<'tcx>])> {
+    let result = match self {
+      // Async return must be handled special, because it gets wrapped in `Poll::Ready`
+      Self::Async { .. } if child.local == RETURN_PLACE => {
+        let in_poll = destination.project_deeper(
+          &[PlaceElem::Downcast(None, async_info.poll_ready_variant_idx)],
+          tcx,
+        );
+        let field_idx = async_info.poll_ready_field_idx;
+        let child_inner_return_type = in_poll
+          .ty(parent_body.local_decls(), tcx)
+          .field_ty(tcx, field_idx);
+        (
+          in_poll
+            .project_deeper(&[PlaceElem::Field(field_idx, child_inner_return_type)], tcx),
+          &child.projection[..],
+        )
+      }
+      _ if child.local == RETURN_PLACE => (destination, &child.projection[..]),
+      // Map arguments to the argument array
+      Self::Direct(args) => (
+        args[child.local.as_usize() - 1].place()?,
+        &child.projection[..],
+      ),
+      // Map arguments to projections of the future, the poll's first argument
+      Self::Async(cc) => {
+        if child.local.as_usize() == 1 {
+          let PlaceElem::Field(idx, _) = child.projection[0] else {
+            panic!("Unexpected non-projection of async context")
+          };
+          let op = match cc {
+            AsyncCallingConvention::Fn(args) => &args[idx.as_usize()],
+            AsyncCallingConvention::Block(args) => &args[idx],
+          };
+          (op.place()?, &child.projection[1 ..])
+        } else {
+          return None;
+        }
+      }
+      // Map closure captures to the first argument.
+      // Map formal parameters to the second argument.
+      Self::Indirect {
+        closure_arg,
+        tupled_arguments,
+      } => {
+        if child.local.as_usize() == 1 {
+          (closure_arg.place()?, &child.projection[..])
+        } else {
+          let tuple_arg = tupled_arguments.place()?;
+          let _projection = child.projection.to_vec();
+          let field = FieldIdx::from_usize(child.local.as_usize() - 2);
+          let field_ty = tuple_arg.ty(parent_body, tcx).field_ty(tcx, field);
+          (
+            tuple_arg.project_deeper(&[PlaceElem::Field(field, field_ty)], tcx),
+            &child.projection[..],
+          )
+        }
+      }
+    };
+    Some(result)
+  }
+}
+
+#[derive(Clone, Copy)]
+enum AsyncCallingConvention<'tcx, 'a> {
+  Fn(&'a [Operand<'tcx>]),
+  Block(&'a IndexSlice<FieldIdx, Operand<'tcx>>),
 }
 
 struct DfAnalysis<'a, 'tcx>(&'a GraphConstructor<'tcx>);
