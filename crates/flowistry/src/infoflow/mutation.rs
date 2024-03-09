@@ -243,11 +243,13 @@ where
 
         for arg in arg_places {
           for arg_mut in self.place_info.reachable_values(arg, Mutability::Mut) {
-            mutations.push(Mutation {
-              mutated: *arg_mut,
-              inputs: arg_inputs.clone(),
-              status: MutationStatus::Possibly,
-            });
+            if *arg_mut != arg {
+              mutations.push(Mutation {
+                mutated: *arg_mut,
+                inputs: arg_inputs.clone(),
+                status: MutationStatus::Possibly,
+              });
+            }
           }
         }
 
