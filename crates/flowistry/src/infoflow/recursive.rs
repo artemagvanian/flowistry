@@ -10,7 +10,7 @@ use super::{analysis::FlowAnalysis, BODY_STACK};
 use crate::{
   extensions::REACHED_LIBRARY,
   infoflow::{
-    mutation::{Mutation, MutationStatus},
+    mutation::{Mutation, MutationStatus, Reason},
     FlowDomain,
   },
   mir::utils,
@@ -223,6 +223,11 @@ impl<'tcx> FlowAnalysis<'tcx> {
       Some(Mutation {
         mutated: parent,
         inputs: parent_deps.clone(),
+        reason: if was_return {
+          Reason::AssignTarget
+        } else {
+          Reason::Argument(parent.local.as_u32() as u8 - 1)
+        },
         status: if was_return {
           MutationStatus::Definitely
         } else {

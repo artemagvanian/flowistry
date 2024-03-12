@@ -25,11 +25,23 @@ pub enum MutationStatus {
   Possibly,
 }
 
+/// Why did this mutation occur
+#[derive(Debug)]
+pub enum Reason {
+  /// It was a function argument
+  Argument(u8),
+  /// It was target of an assign (via return or regular assign)
+  AssignTarget,
+}
+
 /// Information about a particular mutation.
 #[derive(Debug)]
 pub struct Mutation<'tcx> {
   /// The place that is being mutated.
   pub mutated: Place<'tcx>,
+
+  /// Simplified reason why this mutation occurred.
+  pub reason: Reason,
 
   /// The set of inputs to the mutating operation.
   pub inputs: Vec<Place<'tcx>>,
@@ -123,6 +135,7 @@ where
             let mutations = fields
               .map(|(mutated, input)| Mutation {
                 mutated,
+                reason: Reason::AssignTarget,
                 inputs: input.into_iter().collect::<Vec<_>>(),
                 status: MutationStatus::Definitely,
               })
@@ -152,6 +165,7 @@ where
                 let input_field = place.project_deeper(&[field], tcx);
                 Mutation {
                   mutated: mutated_field,
+                  reason: Reason::AssignTarget,
                   inputs: vec![input_field],
                   status: MutationStatus::Definitely,
                 }
@@ -161,6 +175,7 @@ where
             if mutations.is_empty() {
               mutations.push(Mutation {
                 mutated: *mutated,
+                reason: Reason::AssignTarget,
                 inputs: vec![*place],
                 status: MutationStatus::Definitely,
               });
@@ -180,6 +195,7 @@ where
           .collect::<Vec<_>>();
         (self.f)(location, vec![Mutation {
           mutated: *mutated,
+          reason: Reason::AssignTarget,
           inputs,
           status: MutationStatus::Definitely,
         }]);
@@ -193,6 +209,7 @@ where
     collector.visit_rvalue(rvalue, location);
     (self.f)(location, vec![Mutation {
       mutated: *mutated,
+      reason: Reason::AssignTarget,
       inputs: collector.0,
       status: MutationStatus::Definitely,
     }]);
@@ -238,14 +255,16 @@ where
         let mut mutations = vec![Mutation {
           mutated: *destination,
           inputs: dest_inputs,
+          reason: Reason::AssignTarget,
           status: MutationStatus::Definitely,
         }];
 
-        for arg in arg_places {
+        for (num, arg) in arg_places.into_iter().enumerate() {
           for arg_mut in self.place_info.reachable_values(arg, Mutability::Mut) {
             if *arg_mut != arg {
               mutations.push(Mutation {
                 mutated: *arg_mut,
+                reason: Reason::Argument(num as u8),
                 inputs: arg_inputs.clone(),
                 status: MutationStatus::Possibly,
               });
