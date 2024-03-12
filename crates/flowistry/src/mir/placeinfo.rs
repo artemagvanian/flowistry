@@ -29,9 +29,9 @@ use crate::extensions::{is_extension_active, MutabilityMode};
 
 /// Utilities for analyzing places: children, aliases, etc.
 pub struct PlaceInfo<'tcx> {
-  pub(crate) tcx: TyCtxt<'tcx>,
-  pub(crate) body: &'tcx Body<'tcx>,
-  pub(crate) def_id: DefId,
+  pub tcx: TyCtxt<'tcx>,
+  pub body: &'tcx Body<'tcx>,
+  pub def_id: DefId,
   location_domain: Rc<LocationOrArgDomain>,
 
   // Core computed data structure

@@ -63,7 +63,7 @@ pub fn arg_places<'tcx>(args: &[Operand<'tcx>]) -> Vec<(usize, Place<'tcx>)> {
 /// any place of type Context in function calls.
 ///
 /// See test: async_two_await
-pub(crate) struct AsyncHack<'a, 'tcx> {
+pub struct AsyncHack<'a, 'tcx> {
   context_ty: Option<Ty<'tcx>>,
   tcx: TyCtxt<'tcx>,
   body: &'a Body<'tcx>,
