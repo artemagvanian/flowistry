@@ -365,14 +365,22 @@ impl<'tcx> Aliases<'tcx> {
   pub fn aliases(&self, place: Place<'tcx>) -> PlaceSet<'tcx> {
     let mut aliases = HashSet::default();
 
-    // Places with no derefs, or derefs from arguments, have no aliases
-    if place.is_direct(self.body) {
+    // Argument places can be indirect
+    if place.is_arg(self.body) {
       aliases.insert(place);
       return aliases;
     }
 
     // place = after[*ptr]
-    let (ptr, after) = place.refs_in_projection().last().unwrap();
+    let Some((ptr, after)) = place
+      .refs_in_projection()
+      .filter(|(pref, _projects)| !pref.ty(self.body, self.tcx).ty.is_box())
+      .last()
+    else {
+      // This is a direct place
+      aliases.insert(place);
+      return aliases;
+    };
 
     // ptr : &'region orig_ty
     let ptr_ty = ptr.ty(self.body.local_decls(), self.tcx).ty;
