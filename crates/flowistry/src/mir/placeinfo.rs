@@ -143,7 +143,7 @@ impl<'tcx> PlaceInfo<'tcx> {
               return true;
             }
           }
-          place.is_direct(self.body)
+          place.is_direct(self.body, self.tcx)
         })
         .collect()
     })

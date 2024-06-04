@@ -187,7 +187,7 @@ impl<'tcx> Aliases<'tcx> {
     let mut gather_borrows = GatherBorrows::default();
     gather_borrows.visit_body(&body_with_facts.body);
     for (region, kind, place) in gather_borrows.borrows {
-      if place.is_direct(body) {
+      if place.is_direct(body, tcx) {
         contains
           .entry(region)
           .or_default()
