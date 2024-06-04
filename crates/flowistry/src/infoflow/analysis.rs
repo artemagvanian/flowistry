@@ -103,7 +103,7 @@ impl<'tcx> FlowAnalysis<'tcx> {
 
   fn provenance(&self, place: Place<'tcx>) -> SmallVec<[Place<'tcx>; 8]> {
     place
-      .refs_in_projection()
+      .refs_in_projection(self.body, self.tcx)
       .flat_map(|(place_ref, _)| {
         self
           .place_info

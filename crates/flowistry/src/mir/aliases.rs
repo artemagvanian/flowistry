@@ -194,7 +194,7 @@ impl<'tcx> Aliases<'tcx> {
           .insert((place, kind.to_mutbl_lossy()));
       }
 
-      let def = match place.refs_in_projection().next() {
+      let def = match place.refs_in_projection(body, tcx).next() {
         Some((ptr, proj)) => {
           let ptr_ty = ptr.ty(body.local_decls(), tcx).ty;
           (ptr_ty.builtin_deref(true).unwrap().ty, proj.to_vec())
@@ -372,11 +372,7 @@ impl<'tcx> Aliases<'tcx> {
     }
 
     // place = after[*ptr]
-    let Some((ptr, after)) = place
-      .refs_in_projection()
-      .filter(|(pref, _projects)| !pref.ty(self.body, self.tcx).ty.is_box())
-      .last()
-    else {
+    let Some((ptr, after)) = place.refs_in_projection(&self.body, self.tcx).last() else {
       // This is a direct place
       aliases.insert(place);
       return aliases;
