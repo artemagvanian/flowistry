@@ -26,7 +26,7 @@ use rustc_utils::{
   BodyExt, MutabilityExt, PlaceExt,
 };
 
-use super::{aliases::Aliases, utils::PlaceSet};
+use super::{aliases::Aliases, utils::PlaceSet, FlowistryInput};
 use crate::extensions::{is_extension_active, MutabilityMode};
 
 /// Utilities for analyzing places: children, aliases, etc.
@@ -58,25 +58,20 @@ impl<'tcx> PlaceInfo<'tcx> {
   pub fn build(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    body_with_facts: &'tcx BodyWithBorrowckFacts<'tcx>,
+    input: impl FlowistryInput<'tcx>,
   ) -> Self {
-    Self::build_from_input_facts(
-      tcx,
-      def_id,
-      &body_with_facts.body,
-      &**body_with_facts.input_facts.as_ref().unwrap(),
-    )
+    Self::build_from_input_facts(tcx, def_id, input)
   }
   /// Computes all the metadata about places used within the infoflow analysis.
   pub fn build_from_input_facts(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    body: &'tcx Body<'tcx>,
-    input_facts: &PoloniusInput,
+    input: impl FlowistryInput<'tcx>,
   ) -> Self {
     block_timer!("aliases");
+    let body = input.body();
     let location_domain = Self::build_location_arg_domain(body);
-    let aliases = Aliases::build_from_input_facts(tcx, def_id, body, input_facts);
+    let aliases = Aliases::build(tcx, def_id, input);
 
     PlaceInfo {
       aliases,

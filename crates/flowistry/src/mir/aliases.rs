@@ -21,6 +21,7 @@ use rustc_middle::{
 };
 use rustc_utils::{mir::place::UNKNOWN_REGION, timer::elapsed, PlaceExt};
 
+use super::FlowistryInput;
 use crate::{
   extensions::{is_extension_active, PointerMode},
   mir::utils::{AsyncHack, PlaceSet},
@@ -73,24 +74,14 @@ impl<'tcx> Aliases<'tcx> {
   pub fn build(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    body_with_facts: &'tcx BodyWithBorrowckFacts<'tcx>,
+    input: impl FlowistryInput<'tcx>,
   ) -> Self {
-    Self::build_from_input_facts(
+    let loans = Self::compute_loans(tcx, def_id, input, |_, _, _| true);
+    Aliases {
       tcx,
-      def_id,
-      &body_with_facts.body,
-      &**body_with_facts.input_facts.as_ref().unwrap(),
-    )
-  }
-  /// Runs the alias analysis on a given `body_with_facts`.
-  pub fn build_from_input_facts(
-    tcx: TyCtxt<'tcx>,
-    def_id: DefId,
-    body: &'tcx Body<'tcx>,
-    input_facts: &PoloniusInput,
-  ) -> Self {
-    let loans = Self::compute_loans(tcx, def_id, body, input_facts, |_, _, _| true);
-    Aliases { tcx, body, loans }
+      body: input.body(),
+      loans,
+    }
   }
 
   /// Alternative constructor if you need to filter out certain borrowck facts.
@@ -99,19 +90,13 @@ impl<'tcx> Aliases<'tcx> {
   pub fn build_with_fact_selection(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    body_with_facts: &'tcx BodyWithBorrowckFacts<'tcx>,
+    input: impl FlowistryInput<'tcx>,
     selector: impl Fn(RegionVid, RegionVid, BorrowckLocationIndex) -> bool,
   ) -> Self {
-    let loans = Self::compute_loans(
-      tcx,
-      def_id,
-      &body_with_facts.body,
-      &**body_with_facts.input_facts.as_ref().unwrap(),
-      selector,
-    );
+    let loans = Self::compute_loans(tcx, def_id, input, selector);
     Aliases {
       tcx,
-      body: &body_with_facts.body,
+      body: input.body(),
       loans,
     }
   }
@@ -119,15 +104,14 @@ impl<'tcx> Aliases<'tcx> {
   fn compute_loans(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    body: &Body<'tcx>,
-    input_facts: &PoloniusInput,
+    input: impl FlowistryInput<'tcx>,
     constraint_selector: impl Fn(RegionVid, RegionVid, BorrowckLocationIndex) -> bool,
   ) -> LoanMap<'tcx> {
     let start = Instant::now();
-    let body = body;
+    let body = input.body();
     let static_region = RegionVid::from_usize(0);
-    let subset_base = input_facts
-      .subset_base
+    let subset_base = input
+      .input_facts_subset_base()
       .iter()
       .filter(|(r1, r2, i)| constraint_selector(*r1, *r2, *i))
       .collect::<Vec<_>>();
