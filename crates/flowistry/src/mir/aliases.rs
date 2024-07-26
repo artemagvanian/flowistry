@@ -3,7 +3,8 @@
 use std::{hash::Hash, time::Instant};
 
 use log::{debug, info};
-use rustc_borrowck::consumers::BodyWithBorrowckFacts;
+use polonius_engine::AllFacts;
+use rustc_borrowck::consumers::{BodyWithBorrowckFacts, PoloniusInput};
 use rustc_data_structures::{
   fx::{FxHashMap as HashMap, FxHashSet as HashSet},
   graph::{iterate::reverse_post_order, scc::Sccs, vec_graph::VecGraph},
@@ -74,12 +75,22 @@ impl<'tcx> Aliases<'tcx> {
     def_id: DefId,
     body_with_facts: &'tcx BodyWithBorrowckFacts<'tcx>,
   ) -> Self {
-    let loans = Self::compute_loans(tcx, def_id, body_with_facts, |_, _, _| true);
-    Aliases {
+    Self::build_from_input_facts(
       tcx,
-      body: &body_with_facts.body,
-      loans,
-    }
+      def_id,
+      &body_with_facts.body,
+      &**body_with_facts.input_facts.as_ref().unwrap(),
+    )
+  }
+  /// Runs the alias analysis on a given `body_with_facts`.
+  pub fn build_from_input_facts(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    body: &'tcx Body<'tcx>,
+    input_facts: &PoloniusInput,
+  ) -> Self {
+    let loans = Self::compute_loans(tcx, def_id, body, input_facts, |_, _, _| true);
+    Aliases { tcx, body, loans }
   }
 
   /// Alternative constructor if you need to filter out certain borrowck facts.
@@ -91,7 +102,13 @@ impl<'tcx> Aliases<'tcx> {
     body_with_facts: &'tcx BodyWithBorrowckFacts<'tcx>,
     selector: impl Fn(RegionVid, RegionVid, BorrowckLocationIndex) -> bool,
   ) -> Self {
-    let loans = Self::compute_loans(tcx, def_id, body_with_facts, selector);
+    let loans = Self::compute_loans(
+      tcx,
+      def_id,
+      &body_with_facts.body,
+      &**body_with_facts.input_facts.as_ref().unwrap(),
+      selector,
+    );
     Aliases {
       tcx,
       body: &body_with_facts.body,
@@ -102,19 +119,16 @@ impl<'tcx> Aliases<'tcx> {
   fn compute_loans(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    body_with_facts: &'tcx BodyWithBorrowckFacts<'tcx>,
+    body: &Body<'tcx>,
+    input_facts: &PoloniusInput,
     constraint_selector: impl Fn(RegionVid, RegionVid, BorrowckLocationIndex) -> bool,
   ) -> LoanMap<'tcx> {
     let start = Instant::now();
-    let body = &body_with_facts.body;
+    let body = body;
     let static_region = RegionVid::from_usize(0);
-    let subset_base = &body_with_facts
-      .input_facts
-      .as_ref()
-      .unwrap()
+    let subset_base = input_facts
       .subset_base
       .iter()
-      .cloned()
       .filter(|(r1, r2, i)| constraint_selector(*r1, *r2, *i))
       .collect::<Vec<_>>();
 
@@ -165,11 +179,7 @@ impl<'tcx> Aliases<'tcx> {
         }
       }
 
-      let constraints = generate_conservative_constraints(
-        tcx,
-        &body_with_facts.body,
-        &region_to_pointers,
-      );
+      let constraints = generate_conservative_constraints(tcx, body, &region_to_pointers);
 
       for (a, b) in constraints {
         subset.insert(a, b);
@@ -185,7 +195,7 @@ impl<'tcx> Aliases<'tcx> {
     //   If p = p^[* p2]: definite('a, ty(p2), p2^[])
     //   Else:            definite('a, ty(p),  p^[]).
     let mut gather_borrows = GatherBorrows::default();
-    gather_borrows.visit_body(&body_with_facts.body);
+    gather_borrows.visit_body(body);
     for (region, kind, place) in gather_borrows.borrows {
       if place.is_direct(body, tcx) {
         contains

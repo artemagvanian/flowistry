@@ -3,7 +3,8 @@
 use std::{ops::ControlFlow, rc::Rc};
 
 use indexical::ToIndex;
-use rustc_borrowck::consumers::BodyWithBorrowckFacts;
+use polonius_engine::AllFacts;
+use rustc_borrowck::consumers::{BodyWithBorrowckFacts, PoloniusInput};
 use rustc_hir::def_id::DefId;
 use rustc_middle::{
   mir::*,
@@ -15,6 +16,7 @@ use rustc_utils::{
   block_timer,
   cache::{Cache, CopyCache},
   mir::{
+    body,
     location_or_arg::{
       index::{LocationOrArgDomain, LocationOrArgIndex},
       LocationOrArg,
@@ -58,10 +60,23 @@ impl<'tcx> PlaceInfo<'tcx> {
     def_id: DefId,
     body_with_facts: &'tcx BodyWithBorrowckFacts<'tcx>,
   ) -> Self {
+    Self::build_from_input_facts(
+      tcx,
+      def_id,
+      &body_with_facts.body,
+      &**body_with_facts.input_facts.as_ref().unwrap(),
+    )
+  }
+  /// Computes all the metadata about places used within the infoflow analysis.
+  pub fn build_from_input_facts(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    body: &'tcx Body<'tcx>,
+    input_facts: &PoloniusInput,
+  ) -> Self {
     block_timer!("aliases");
-    let body = &body_with_facts.body;
     let location_domain = Self::build_location_arg_domain(body);
-    let aliases = Aliases::build(tcx, def_id, body_with_facts);
+    let aliases = Aliases::build_from_input_facts(tcx, def_id, body, input_facts);
 
     PlaceInfo {
       aliases,
