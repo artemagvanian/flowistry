@@ -12,7 +12,7 @@
     "type": "git"
   },
   "description": "Information Flow in the IDE for Rust",
-  "version": "0.5.41",
+  "version": "0.5.42",
   "engines": {
     "vscode": "^1.54.0"
   },
@@ -27,9 +27,6 @@
     "onLanguage:rust"
   ],
   "main": "./out/extension.js",
-  "files": [
-    "out"
-  ],
   "contributes": {
     "commands": [
       {

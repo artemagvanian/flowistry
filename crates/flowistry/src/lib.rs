@@ -79,7 +79,5 @@ extern crate smallvec;
 pub mod extensions;
 pub mod infoflow;
 pub mod mir;
-#[cfg(feature = "pdg")]
-pub mod pdg;
 #[cfg(feature = "test")]
 pub mod test_utils;

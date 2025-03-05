@@ -3,8 +3,6 @@
 use std::{hash::Hash, time::Instant};
 
 use log::{debug, info};
-use polonius_engine::AllFacts;
-use rustc_borrowck::consumers::{BodyWithBorrowckFacts, PoloniusInput};
 use rustc_data_structures::{
   fx::{FxHashMap as HashMap, FxHashSet as HashSet},
   graph::{iterate::reverse_post_order, scc::Sccs, vec_graph::VecGraph},
@@ -26,9 +24,6 @@ use crate::{
   extensions::{is_extension_active, PointerMode},
   mir::utils::{AsyncHack, PlaceSet},
 };
-
-type BorrowckLocationIndex =
-  <rustc_borrowck::consumers::RustcFacts as crate::polonius_engine::FactTypes>::Point;
 
 #[derive(Default)]
 struct GatherBorrows<'tcx> {
@@ -65,6 +60,7 @@ pub struct Aliases<'tcx> {
 }
 
 rustc_index::newtype_index! {
+  #[orderable]
   #[debug_format = "rs{}"]
   struct RegionSccIndex {}
 }
@@ -84,7 +80,10 @@ impl<'tcx> Aliases<'tcx> {
     }
   }
 
-  fn compute_loans<'a>(
+  /// Alternative constructor if you need to filter out certain borrowck facts.
+  ///
+  /// Just use [`Aliases::build`] unless you know what you're doing.
+  pub fn compute_loans<'a>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     input: impl FlowistryInput<'tcx, 'a>,
@@ -162,14 +161,14 @@ impl<'tcx> Aliases<'tcx> {
     let mut gather_borrows = GatherBorrows::default();
     gather_borrows.visit_body(body);
     for (region, kind, place) in gather_borrows.borrows {
-      if place.is_direct(body, tcx) {
+      if place.is_direct(body) {
         contains
           .entry(region)
           .or_default()
           .insert((place, kind.to_mutbl_lossy()));
       }
 
-      let def = match place.refs_in_projection(body, tcx).next() {
+      let def = match place.refs_in_projection().next() {
         Some((ptr, proj)) => {
           let ptr_ty = ptr.ty(body.local_decls(), tcx).ty;
           (ptr_ty.builtin_deref(true).unwrap().ty, proj.to_vec())
@@ -347,7 +346,7 @@ impl<'tcx> Aliases<'tcx> {
     }
 
     // place = after[*ptr]
-    let Some((ptr, after)) = place.refs_in_projection(&self.body, self.tcx).last() else {
+    let Some((ptr, after)) = place.refs_in_projection().last() else {
       // This is a direct place
       aliases.insert(place);
       return aliases;

@@ -3,8 +3,6 @@
 use std::{ops::ControlFlow, rc::Rc};
 
 use indexical::ToIndex;
-use polonius_engine::AllFacts;
-use rustc_borrowck::consumers::{BodyWithBorrowckFacts, PoloniusInput};
 use rustc_hir::def_id::DefId;
 use rustc_middle::{
   mir::*,
@@ -16,7 +14,6 @@ use rustc_utils::{
   block_timer,
   cache::{Cache, CopyCache},
   mir::{
-    body,
     location_or_arg::{
       index::{LocationOrArgDomain, LocationOrArgIndex},
       LocationOrArg,
@@ -146,14 +143,13 @@ impl<'tcx> PlaceInfo<'tcx> {
         .into_iter()
         .chain([place])
         .filter(|place| {
-          if let Some((place, _)) = place.refs_in_projection(&self.body, self.tcx).last()
-          {
+          if let Some((place, _)) = place.refs_in_projection().last() {
             let ty = place.ty(self.body.local_decls(), self.tcx).ty;
             if ty.is_box() || ty.is_unsafe_ptr() {
               return true;
             }
           }
-          place.is_direct(self.body, self.tcx)
+          place.is_direct(self.body)
         })
         .collect()
     })
@@ -236,7 +232,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for LoanCollector<'_, 'tcx> {
       RegionKind::ReStatic => RegionVid::from_usize(0),
       // TODO: do we need to handle bound regions?
       // e.g. shows up with closures, for<'a> ...
-      RegionKind::ReErased | RegionKind::ReLateBound(_, _) => {
+      RegionKind::ReErased | RegionKind::ReBound(..) => {
         return ControlFlow::Continue(());
       }
       _ => unreachable!("{region:?}"),
