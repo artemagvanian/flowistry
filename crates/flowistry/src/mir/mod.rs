@@ -1,7 +1,6 @@
 //! Infrastructure for analyzing MIR that supports the information flow analysis.
 
 use polonius_engine::FactTypes;
-use rustc_ast::token::TokenKind::FatArrow;
 use rustc_borrowck::consumers::{BodyWithBorrowckFacts, RustcFacts};
 use rustc_middle::mir::Body;
 
