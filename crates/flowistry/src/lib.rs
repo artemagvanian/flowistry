@@ -48,7 +48,6 @@
   clippy::len_zero,
   clippy::len_without_is_empty
 )]
-#![warn(missing_docs)]
 
 extern crate either;
 extern crate polonius_engine;
@@ -79,7 +78,5 @@ extern crate smallvec;
 pub mod extensions;
 pub mod infoflow;
 pub mod mir;
-#[cfg(feature = "pdg")]
-pub mod pdg;
 #[cfg(feature = "test")]
 pub mod test_utils;

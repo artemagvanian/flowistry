@@ -8,7 +8,7 @@ use rustc_middle::{
   mir::{visit::Visitor, *},
   ty::TyCtxt,
 };
-use rustc_mir_dataflow::{Analysis, AnalysisDomain, Forward};
+use rustc_mir_dataflow::{Analysis, AnalysisDomain};
 use rustc_utils::{
   mir::{
     control_dependencies::ControlDependencies,
@@ -103,7 +103,7 @@ impl<'tcx> FlowAnalysis<'tcx> {
 
   fn provenance(&self, place: Place<'tcx>) -> SmallVec<[Place<'tcx>; 8]> {
     place
-      .refs_in_projection(self.body, self.tcx)
+      .refs_in_projection()
       .flat_map(|(place_ref, _)| {
         self
           .place_info
@@ -243,7 +243,6 @@ impl<'tcx> FlowAnalysis<'tcx> {
 
 impl<'tcx> AnalysisDomain<'tcx> for FlowAnalysis<'tcx> {
   type Domain = FlowDomain<'tcx>;
-  type Direction = Forward;
   const NAME: &'static str = "FlowAnalysis";
 
   fn bottom_value(&self, _body: &Body<'tcx>) -> Self::Domain {
